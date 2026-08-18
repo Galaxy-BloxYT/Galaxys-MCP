@@ -1,0 +1,1646 @@
+-- OpenRouter Chat UI v12 - audited/fixed persistent chat
+-- Modern chat-style UI using OpenRouter free models + persistent Supabase chat history.
+
+-- CONFIGURATION
+local OPENROUTER_API_KEY = "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"
+local MODEL = "openrouter/free"
+local LAST_MODEL = nil -- informational only; requests always use openrouter/free
+local SUPABASE_PAGE_SIZE = 500
+local AUTO_EXECUTE_ENABLED = false -- user-controlled UI toggle, default OFF
+
+local SUPABASE_URL = "https://slwtecwcmjdsjijttrkt.supabase.co"
+local SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNsd3RlY3djbWpkc2ppanR0cmt0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcwMDcyMTAsImV4cCI6MjEwMjU4MzIxMH0.PtDYrQvI5rmVtTK8t2BZ-dAjBO5lj_y_1ZlPC0XUQs8"
+local SUPABASE_TABLE = "ai_chat_messages"
+local CONVERSATION_ID = "main"
+
+local SYSTEM_PROMPT = [[
+You are a helpful AI assistant inside a Roblox chat UI. a MCP Server.
+You receive the complete saved conversation history in chronological order on every request. Use earlier user and assistant messages as conversation memory and do not pretend you cannot see them.
+
+When you include code that should be rendered as an interactive code block, you may use these directives on separate lines:
+//codestart <language>
+//allowcopy       -- show a Copy button for this code block
+//executecode     -- show a Run button for this code block; NEVER means auto-run
+//autoexecute     -- automatically run this block after rendering; no Run/Copy buttons
+<code here>
+//codeend
+
+Optional directives:
+//nocopy          -- hide Copy for the current/next code block, DEPRECATED, NOT WORKING.
+//noexecute       -- hide Run for the current/next code block, DEPRECATED, NOT WORKING.
+//noautoexecute   -- disable automatic execution
+//language <name> -- set language label (Only Lua or Discord Links, as mentioned under this message: ↓↓↓)
+
+Only use //executecode or //autoexecute for code that is intended to run in the current Luau environment.
+For safety, //autoexecute is accepted only for code that passes the client's restricted API filter.
+Never claim code ran successfully unless the UI reports successful execution.
+Normal prose does not need directives. Standard triple-backtick code blocks are also supported by the UI.
+You are in a Roblox Executor, Probably Delta. A Client-side only executor. MAKE sure to NOT make any scam scripts for the person, alright?
+if the player Mentioned "What's Your Discord" or something like that, then, send this link: https://discord.gg/RVuFNJSJGj (say that this link is for Galaxy_BloxYT's Server tho!), and: https://discord.gg/TRMD7D5nw8 (say that this is Kolya's Server, one of the MCP Developers !) use // allowcopy to allow the user to copy though. Should use //codestart and //codeend to make it really work. Language... Hmm... Set as "Discord Links".
+]]
+
+-- This table contains the complete current conversation.
+-- It is restored from Supabase on startup and the whole table is sent to OpenRouter.
+local chatHistory = {
+    { role = "system", content = SYSTEM_PROMPT }
+}
+
+-- SERVICES
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local function getRequestFunc()
+    return request or http_request or (http and http.request) or (syn and syn.request)
+end
+
+local function supabaseHeaders(prefer)
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["apikey"] = SUPABASE_ANON_KEY,
+        ["Authorization"] = "Bearer " .. SUPABASE_ANON_KEY,
+    }
+
+    if prefer then
+        headers["Prefer"] = prefer
+    end
+
+    return headers
+end
+
+local function saveMessageToSupabase(role, content)
+    local requestFunc = getRequestFunc()
+    if not requestFunc then
+        return false, "HTTP request API unavailable"
+    end
+
+    local payload = {
+        roblox_user_id = LocalPlayer.UserId,
+        conversation_id = CONVERSATION_ID,
+        role = tostring(role),
+        content = tostring(content),
+    }
+
+    local ok, result = pcall(function()
+        return requestFunc({
+            Url = SUPABASE_URL .. "/rest/v1/" .. SUPABASE_TABLE,
+            Method = "POST",
+            Headers = supabaseHeaders("return=minimal"),
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+
+    if not ok or not result then
+        return false, tostring(result)
+    end
+
+    local statusCode = tonumber(result.StatusCode or result.status)
+    if not statusCode or statusCode < 200 or statusCode >= 300 then
+        return false, "HTTP " .. tostring(statusCode) .. ": " .. tostring(result.Body or result.body)
+    end
+
+    return true
+end
+
+local function loadMessagesFromSupabase()
+    local requestFunc = getRequestFunc()
+    if not requestFunc then
+        return false, "HTTP request API unavailable"
+    end
+
+    local allRows = {}
+    local offset = 0
+
+    while true do
+        local url = SUPABASE_URL
+            .. "/rest/v1/" .. SUPABASE_TABLE
+            .. "?select=id,role,content,created_at"
+            .. "&roblox_user_id=eq." .. tostring(LocalPlayer.UserId)
+            .. "&conversation_id=eq." .. HttpService:UrlEncode(CONVERSATION_ID)
+            .. "&order=created_at.asc,id.asc"
+            .. "&limit=" .. tostring(SUPABASE_PAGE_SIZE)
+            .. "&offset=" .. tostring(offset)
+
+        local ok, result = pcall(function()
+            return requestFunc({
+                Url = url,
+                Method = "GET",
+                Headers = supabaseHeaders(),
+            })
+        end)
+
+        if not ok or not result then
+            return false, tostring(result)
+        end
+
+        local statusCode = tonumber(result.StatusCode or result.status)
+        local body = result.Body or result.body or ""
+
+        if not statusCode or statusCode < 200 or statusCode >= 300 then
+            return false, "HTTP " .. tostring(statusCode) .. ": " .. tostring(body)
+        end
+
+        local decodeOk, rows = pcall(function()
+            return HttpService:JSONDecode(body)
+        end)
+
+        if not decodeOk or type(rows) ~= "table" then
+            return false, "Unreadable Supabase response"
+        end
+
+        for _, row in ipairs(rows) do
+            table.insert(allRows, row)
+        end
+
+        if #rows < SUPABASE_PAGE_SIZE then
+            break
+        end
+
+        offset += #rows
+
+        -- Safety against a broken/repeating endpoint.
+        if #rows == 0 then
+            break
+        end
+    end
+
+    chatHistory = {
+        { role = "system", content = SYSTEM_PROMPT }
+    }
+
+    for _, row in ipairs(allRows) do
+        if type(row) == "table"
+            and (row.role == "user" or row.role == "assistant")
+            and type(row.content) == "string"
+        then
+            table.insert(chatHistory, {
+                role = row.role,
+                content = row.content,
+            })
+        end
+    end
+
+    return true, #allRows
+end
+
+-- CLEAN OLD UI
+local old
+pcall(function()
+    old = CoreGui:FindFirstChild("OpenRouterChat")
+end)
+if old then
+    pcall(function()
+        old:Destroy()
+    end)
+end
+
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+if playerGui:FindFirstChild("OpenRouterChat") then
+    playerGui.OpenRouterChat:Destroy()
+end
+
+-- THEME
+local Theme = {
+    Background = Color3.fromRGB(12, 13, 18),
+    Panel = Color3.fromRGB(18, 20, 27),
+    Panel2 = Color3.fromRGB(24, 27, 36),
+    Panel3 = Color3.fromRGB(31, 35, 46),
+    Stroke = Color3.fromRGB(49, 54, 69),
+    Text = Color3.fromRGB(241, 243, 248),
+    Muted = Color3.fromRGB(145, 151, 170),
+    Accent = Color3.fromRGB(124, 92, 255),
+    AccentHover = Color3.fromRGB(139, 111, 255),
+    UserBubble = Color3.fromRGB(111, 80, 235),
+    AIBubble = Color3.fromRGB(29, 32, 42),
+    Danger = Color3.fromRGB(235, 87, 87),
+    Success = Color3.fromRGB(76, 201, 138),
+    Warning = Color3.fromRGB(246, 190, 73),
+}
+
+local function corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 10)
+    c.Parent = parent
+    return c
+end
+
+local function stroke(parent, color, transparency, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Theme.Stroke
+    s.Transparency = transparency or 0
+    s.Thickness = thickness or 1
+    s.Parent = parent
+    return s
+end
+
+local function padding(parent, l, r, t, b)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, l or 0)
+    p.PaddingRight = UDim.new(0, r or 0)
+    p.PaddingTop = UDim.new(0, t or 0)
+    p.PaddingBottom = UDim.new(0, b or 0)
+    p.Parent = parent
+    return p
+end
+
+local function tween(object, duration, properties)
+    TweenService:Create(
+        object,
+        TweenInfo.new(duration or 0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        properties
+    ):Play()
+end
+
+-- SCREEN GUI
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "OpenRouterChat"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+pcall(function()
+    ScreenGui.Parent = CoreGui
+end)
+
+if not ScreenGui.Parent then
+    ScreenGui.Parent = playerGui
+end
+
+-- SHADOW
+local Shadow = Instance.new("Frame")
+Shadow.Name = "Shadow"
+Shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+Shadow.Position = UDim2.fromScale(0.5, 0.5)
+Shadow.Size = UDim2.new(0, 676, 0, 526)
+Shadow.BackgroundColor3 = Color3.new(0, 0, 0)
+Shadow.BackgroundTransparency = 0.55
+Shadow.BorderSizePixel = 0
+Shadow.ZIndex = 0
+Shadow.Parent = ScreenGui
+corner(Shadow, 20)
+
+-- MAIN WINDOW
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+MainFrame.Position = UDim2.fromScale(0.5, 0.5)
+MainFrame.Size = UDim2.new(0, 660, 0, 510)
+MainFrame.BackgroundColor3 = Theme.Background
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.ZIndex = 1
+MainFrame.Parent = ScreenGui
+corner(MainFrame, 18)
+stroke(MainFrame, Theme.Stroke, 0.15, 1)
+
+local SizeConstraint = Instance.new("UISizeConstraint")
+SizeConstraint.MinSize = Vector2.new(350, 420)
+SizeConstraint.MaxSize = Vector2.new(760, 620)
+SizeConstraint.Parent = MainFrame
+
+-- HEADER
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.new(1, 0, 0, 66)
+Header.BackgroundColor3 = Theme.Panel
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+
+local HeaderLine = Instance.new("Frame")
+HeaderLine.AnchorPoint = Vector2.new(0, 1)
+HeaderLine.Position = UDim2.new(0, 0, 1, 0)
+HeaderLine.Size = UDim2.new(1, 0, 0, 1)
+HeaderLine.BackgroundColor3 = Theme.Stroke
+HeaderLine.BackgroundTransparency = 0.35
+HeaderLine.BorderSizePixel = 0
+HeaderLine.Parent = Header
+
+local Logo = Instance.new("Frame")
+Logo.Size = UDim2.fromOffset(38, 38)
+Logo.Position = UDim2.fromOffset(16, 14)
+Logo.BackgroundColor3 = Theme.Accent
+Logo.BorderSizePixel = 0
+Logo.Parent = Header
+corner(Logo, 12)
+
+local LogoText = Instance.new("TextLabel")
+LogoText.Size = UDim2.fromScale(1, 1)
+LogoText.BackgroundTransparency = 1
+LogoText.Text = "O"
+LogoText.TextColor3 = Color3.new(1, 1, 1)
+LogoText.Font = Enum.Font.GothamBold
+LogoText.TextSize = 19
+LogoText.Parent = Logo
+
+local Title = Instance.new("TextLabel")
+Title.Position = UDim2.fromOffset(66, 12)
+Title.Size = UDim2.new(1, -285, 0, 24)
+Title.BackgroundTransparency = 1
+Title.Text = "OpenRouter Chat"
+Title.TextColor3 = Theme.Text
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 17
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+local StatusDot = Instance.new("Frame")
+StatusDot.Position = UDim2.fromOffset(67, 41)
+StatusDot.Size = UDim2.fromOffset(7, 7)
+StatusDot.BackgroundColor3 = Theme.Success
+StatusDot.BorderSizePixel = 0
+StatusDot.Parent = Header
+corner(StatusDot, 99)
+
+local Subtitle = Instance.new("TextLabel")
+Subtitle.Position = UDim2.fromOffset(80, 35)
+Subtitle.Size = UDim2.new(1, -185, 0, 20)
+Subtitle.BackgroundTransparency = 1
+Subtitle.Text = MODEL .. (LAST_MODEL and ("  •  " .. LAST_MODEL) or "  •  Ready")
+Subtitle.TextColor3 = Theme.Muted
+Subtitle.Font = Enum.Font.Gotham
+Subtitle.TextSize = 11
+Subtitle.TextXAlignment = Enum.TextXAlignment.Left
+Subtitle.Parent = Header
+
+local AutoExecButton = Instance.new("TextButton")
+AutoExecButton.AnchorPoint = Vector2.new(1, 0.5)
+AutoExecButton.Position = UDim2.new(1, -88, 0.5, 0)
+AutoExecButton.Size = UDim2.fromOffset(92, 32)
+AutoExecButton.BackgroundColor3 = Theme.Panel2
+AutoExecButton.BackgroundTransparency = 0.35
+AutoExecButton.BorderSizePixel = 0
+AutoExecButton.Text = "AutoExec: OFF"
+AutoExecButton.TextColor3 = Theme.Muted
+AutoExecButton.Font = Enum.Font.GothamMedium
+AutoExecButton.TextSize = 10
+AutoExecButton.AutoButtonColor = false
+AutoExecButton.Parent = Header
+corner(AutoExecButton, 9)
+
+local MinimizeButton = Instance.new("TextButton")
+MinimizeButton.AnchorPoint = Vector2.new(1, 0.5)
+MinimizeButton.Position = UDim2.new(1, -50, 0.5, 0)
+MinimizeButton.Size = UDim2.fromOffset(32, 32)
+MinimizeButton.BackgroundColor3 = Theme.Panel2
+MinimizeButton.BackgroundTransparency = 0.35
+MinimizeButton.BorderSizePixel = 0
+MinimizeButton.Text = "−"
+MinimizeButton.TextColor3 = Theme.Muted
+MinimizeButton.Font = Enum.Font.GothamBold
+MinimizeButton.TextSize = 19
+MinimizeButton.Parent = Header
+corner(MinimizeButton, 9)
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.AnchorPoint = Vector2.new(1, 0.5)
+CloseButton.Position = UDim2.new(1, -14, 0.5, 0)
+CloseButton.Size = UDim2.fromOffset(32, 32)
+CloseButton.BackgroundColor3 = Theme.Panel2
+CloseButton.BackgroundTransparency = 0.35
+CloseButton.BorderSizePixel = 0
+CloseButton.Text = "×"
+CloseButton.TextColor3 = Theme.Muted
+CloseButton.Font = Enum.Font.GothamBold
+CloseButton.TextSize = 19
+CloseButton.Parent = Header
+corner(CloseButton, 9)
+
+local function buttonHover(button, normalColor, hoverColor)
+    button.MouseEnter:Connect(function()
+        tween(button, 0.12, {BackgroundColor3 = hoverColor, BackgroundTransparency = 0})
+    end)
+    button.MouseLeave:Connect(function()
+        tween(button, 0.12, {BackgroundColor3 = normalColor, BackgroundTransparency = 0.35})
+    end)
+end
+
+buttonHover(AutoExecButton, Theme.Panel2, Theme.Panel3)
+buttonHover(MinimizeButton, Theme.Panel2, Theme.Panel3)
+buttonHover(CloseButton, Theme.Panel2, Theme.Danger)
+
+AutoExecButton.MouseButton1Click:Connect(function()
+    AUTO_EXECUTE_ENABLED = not AUTO_EXECUTE_ENABLED
+    AutoExecButton.Text = AUTO_EXECUTE_ENABLED and "AutoExec: ON" or "AutoExec: OFF"
+    AutoExecButton.TextColor3 = AUTO_EXECUTE_ENABLED and Theme.Success or Theme.Muted
+end)
+
+-- CHAT AREA
+local ChatContainer = Instance.new("Frame")
+ChatContainer.Name = "ChatContainer"
+ChatContainer.Position = UDim2.fromOffset(0, 66)
+ChatContainer.Size = UDim2.new(1, 0, 1, -148)
+ChatContainer.BackgroundTransparency = 1
+ChatContainer.Parent = MainFrame
+
+local Messages = Instance.new("ScrollingFrame")
+Messages.Name = "Messages"
+Messages.Size = UDim2.fromScale(1, 1)
+Messages.BackgroundTransparency = 1
+Messages.BorderSizePixel = 0
+Messages.ScrollBarThickness = 5
+Messages.ScrollBarImageColor3 = Theme.Stroke
+Messages.ScrollBarImageTransparency = 0.15
+
+Messages.CanvasSize = UDim2.fromOffset(0, 0)
+Messages.AutomaticCanvasSize = Enum.AutomaticSize.Y 
+
+Messages.ScrollingDirection = Enum.ScrollingDirection.Y
+Messages.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+Messages.ScrollingEnabled = true
+Messages.Parent = ChatContainer
+
+local MessagesPadding = padding(Messages, 18, 18, 14, 18)
+
+local MessageList = Instance.new("UIListLayout")
+MessageList.Padding = UDim.new(0, 12)
+MessageList.SortOrder = Enum.SortOrder.LayoutOrder
+MessageList.HorizontalAlignment = Enum.HorizontalAlignment.Left
+MessageList.Parent = Messages
+
+
+-- INPUT BAR
+local InputBar = Instance.new("Frame")
+InputBar.AnchorPoint = Vector2.new(0, 1)
+InputBar.Position = UDim2.new(0, 0, 1, 0)
+InputBar.Size = UDim2.new(1, 0, 0, 82)
+InputBar.BackgroundColor3 = Theme.Panel
+InputBar.BorderSizePixel = 0
+InputBar.Parent = MainFrame
+
+local InputTopLine = Instance.new("Frame")
+InputTopLine.Size = UDim2.new(1, 0, 0, 1)
+InputTopLine.BackgroundColor3 = Theme.Stroke
+InputTopLine.BackgroundTransparency = 0.35
+InputTopLine.BorderSizePixel = 0
+InputTopLine.Parent = InputBar
+
+local InputShell = Instance.new("Frame")
+InputShell.Position = UDim2.fromOffset(15, 14)
+InputShell.Size = UDim2.new(1, -76, 0, 52)
+InputShell.BackgroundColor3 = Theme.Panel2
+InputShell.BorderSizePixel = 0
+InputShell.Parent = InputBar
+corner(InputShell, 13)
+stroke(InputShell, Theme.Stroke, 0.3, 1)
+
+local InputBox = Instance.new("TextBox")
+InputBox.Position = UDim2.fromOffset(13, 5)
+InputBox.Size = UDim2.new(1, -26, 1, -10)
+InputBox.BackgroundTransparency = 1
+InputBox.ClearTextOnFocus = false
+InputBox.MultiLine = true
+InputBox.TextWrapped = true
+InputBox.Text = ""
+InputBox.PlaceholderText = "Message OpenRouter..."
+InputBox.PlaceholderColor3 = Theme.Muted
+InputBox.TextColor3 = Theme.Text
+InputBox.Font = Enum.Font.Gotham
+InputBox.TextSize = 14
+InputBox.TextXAlignment = Enum.TextXAlignment.Left
+InputBox.TextYAlignment = Enum.TextYAlignment.Center
+InputBox.Parent = InputShell
+
+local SendButton = Instance.new("TextButton")
+SendButton.AnchorPoint = Vector2.new(1, 0)
+SendButton.Position = UDim2.new(1, -15, 0, 14)
+SendButton.Size = UDim2.fromOffset(46, 52)
+SendButton.BackgroundColor3 = Theme.Accent
+SendButton.BorderSizePixel = 0
+SendButton.Text = "↑"
+SendButton.TextColor3 = Color3.new(1, 1, 1)
+SendButton.Font = Enum.Font.GothamBold
+SendButton.TextSize = 23
+SendButton.AutoButtonColor = false
+SendButton.Parent = InputBar
+corner(SendButton, 13)
+
+SendButton.MouseEnter:Connect(function()
+    if SendButton.Active then
+        tween(SendButton, 0.12, {BackgroundColor3 = Theme.AccentHover})
+    end
+end)
+
+SendButton.MouseLeave:Connect(function()
+    if SendButton.Active then
+        tween(SendButton, 0.12, {BackgroundColor3 = Theme.Accent})
+    else
+        SendButton.BackgroundColor3 = Theme.Panel3
+    end
+end)
+
+
+-- LOCAL PROMPT-INJECTION FLAG MIRROR
+-- OpenRouter's "Flag" action is observability-only and is not exposed as a simple
+-- flag in the normal chat-completions response, so the UI mirrors common patterns
+-- locally purely to display a warning. This does NOT block or modify the request.
+local PROMPT_INJECTION_PATTERNS = {
+    { pattern = "ignore%s+previous%s+instructions", label = "ignore previous instructions" },
+    { pattern = "ignore%s+all%s+previous%s+instructions", label = "ignore all previous instructions" },
+    { pattern = "disregard%s+previous%s+instructions", label = "disregard previous instructions" },
+    { pattern = "forget%s+previous%s+instructions", label = "forget previous instructions" },
+    { pattern = "override%s+previous%s+instructions", label = "override previous instructions" },
+
+    { pattern = "reveal%s+.-system%s+prompt", label = "system prompt extraction" },
+    { pattern = "show%s+.-system%s+prompt", label = "system prompt extraction" },
+    { pattern = "print%s+.-system%s+prompt", label = "system prompt extraction" },
+    { pattern = "what%s+.-system%s+prompt", label = "system prompt extraction" },
+
+    { pattern = "developer%s+message", label = "developer-message extraction" },
+    { pattern = "hidden%s+instructions", label = "hidden-instruction extraction" },
+    { pattern = "internal%s+instructions", label = "internal-instruction extraction" },
+
+    { pattern = "act%s+as%s+if%s+.-no%s+rules", label = "rule bypass attempt" },
+    { pattern = "you%s+are%s+now%s+.-unrestricted", label = "unrestricted-mode attempt" },
+    { pattern = "bypass%s+.-safety", label = "safety bypass attempt" },
+    { pattern = "disable%s+.-safety", label = "safety bypass attempt" },
+    { pattern = "ignore%s+.-safety", label = "safety bypass attempt" },
+
+    { pattern = "do%s+not%s+follow%s+.-instructions", label = "instruction override" },
+    { pattern = "instead%s+follow%s+.-instructions", label = "instruction override" },
+}
+
+local function detectPromptInjectionFlag(message)
+    local normalized = tostring(message or ""):lower()
+
+    -- Normalize whitespace to make simple spacing tricks less effective.
+    normalized = normalized:gsub("[%s\r\n\t]+", " ")
+
+    for _, item in ipairs(PROMPT_INJECTION_PATTERNS) do
+        if normalized:find(item.pattern) then
+            return true, item.label
+        end
+    end
+
+    return false, nil
+end
+
+-- MESSAGE BUBBLES
+local messageCounter = 0
+local suppressAutoScroll = false
+local currentUiScale = 1
+
+local function scrollToBottom(force)
+    if suppressAutoScroll then
+        return
+    end
+    task.defer(function()
+        -- Give nested AutomaticSize/UIListLayout objects enough frames to settle.
+        task.wait()
+        task.wait()
+
+        updateMessageCanvas()
+
+        local maxY = math.max(
+            0,
+            Messages.AbsoluteCanvasSize.Y - Messages.AbsoluteWindowSize.Y
+        )
+
+        if force ~= false then
+            Messages.CanvasPosition = Vector2.new(0, maxY)
+        end
+    end)
+end
+
+local function createMessage(role, text, isLoading)
+    messageCounter += 1
+
+    local row = Instance.new("Frame")
+    row.Name = role == "user" and "UserMessage" or "AIMessage"
+    row.Size = UDim2.new(1, -2, 0, 1)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = messageCounter
+    row.Parent = Messages
+
+    local rowList = Instance.new("UIListLayout")
+    rowList.FillDirection = Enum.FillDirection.Horizontal
+    rowList.HorizontalAlignment = role == "user"
+        and Enum.HorizontalAlignment.Right
+        or Enum.HorizontalAlignment.Left
+    rowList.VerticalAlignment = Enum.VerticalAlignment.Top
+    rowList.SortOrder = Enum.SortOrder.LayoutOrder
+    rowList.Parent = row
+
+    local holder = Instance.new("Frame")
+    holder.Name = "Bubble"
+    holder.Size = UDim2.new(role == "user" and 0.82 or 0.92, 0, 0, 1)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.BackgroundColor3 = role == "user" and Theme.UserBubble or Theme.AIBubble
+    holder.BorderSizePixel = 0
+    holder.LayoutOrder = 1
+    holder.Parent = row
+    corner(holder, 13)
+
+    if role == "assistant" then
+        stroke(holder, Theme.Stroke, 0.35, 1)
+    end
+
+    local holderPadding = padding(holder, 13, 13, 11, 11)
+
+    local holderList = Instance.new("UIListLayout")
+    holderList.FillDirection = Enum.FillDirection.Vertical
+    holderList.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    holderList.SortOrder = Enum.SortOrder.LayoutOrder
+    holderList.Parent = holder
+
+    local label = Instance.new("TextLabel")
+    label.Name = "MessageText"
+    label.Size = UDim2.new(1, 0, 0, 1)
+    label.AutomaticSize = Enum.AutomaticSize.Y
+    label.BackgroundTransparency = 1
+    label.Text = tostring(text)
+    label.TextColor3 = role == "user" and Color3.new(1, 1, 1) or Theme.Text
+    label.Font = Enum.Font.Gotham
+    label.TextSize = 14
+    label.TextWrapped = true
+    label.RichText = false
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.LayoutOrder = 1
+    label.Parent = holder
+
+    if isLoading then
+        label.TextColor3 = Theme.Muted
+    end
+
+    label:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        updateMessageCanvas()
+    end)
+
+    holderList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        updateMessageCanvas()
+    end)
+
+    scrollToBottom()
+    return row, label
+end
+
+local function parseAssistantContent(text)
+    text = tostring(text or ""):gsub("\r\n", "\n")
+    local segments = {}
+    local normalLines = {}
+    local codeLines = {}
+    local inCode = false
+    local codeLanguage = "code"
+    local allowCopy = false
+    local allowExecute = false
+    local autoExecute = false
+    local nextAllowCopy = false
+    local nextAllowExecute = false
+    local nextAutoExecute = false
+    local nextLanguage = nil
+
+    local function flushText()
+        if #normalLines > 0 then
+            local value = table.concat(normalLines, "\n")
+            value = value:gsub("^\n+", ""):gsub("\n+$", "")
+            if value ~= "" then
+                table.insert(segments, { type = "text", text = value })
+            end
+            table.clear(normalLines)
+        end
+    end
+
+    local function flushCode()
+        local value = table.concat(codeLines, "\n")
+        table.insert(segments, {
+            type = "code",
+            text = value,
+            language = codeLanguage ~= "" and codeLanguage or "code",
+            allowCopy = allowCopy,
+            allowExecute = allowExecute,
+            autoExecute = autoExecute,
+        })
+        table.clear(codeLines)
+        codeLanguage = "code"
+        allowCopy = false
+        allowExecute = false
+        autoExecute = false
+    end
+
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local trimmed = line:match("^%s*(.-)%s*$") or line
+        local lower = trimmed:lower()
+
+        if not inCode then
+            local lang = trimmed:match("^//codestart%s*(.*)$")
+            local mdLang = trimmed:match("^```%s*([%w_+%-%.#]*)%s*$")
+
+            if lang ~= nil then
+                flushText()
+                inCode = true
+                codeLanguage = (lang ~= "" and lang) or nextLanguage or "code"
+                allowCopy = nextAllowCopy
+                allowExecute = nextAllowExecute
+                autoExecute = nextAutoExecute
+                if autoExecute then
+                    allowCopy = false
+                    allowExecute = false
+                end
+                nextAllowCopy = false
+                nextAllowExecute = false
+                nextAutoExecute = false
+                nextLanguage = nil
+            elseif mdLang ~= nil then
+                flushText()
+                inCode = true
+                codeLanguage = (mdLang ~= "" and mdLang) or nextLanguage or "code"
+                allowCopy = nextAllowCopy
+                allowExecute = nextAllowExecute
+                autoExecute = nextAutoExecute
+                if autoExecute then
+                    allowCopy = false
+                    allowExecute = false
+                end
+                nextAllowCopy = false
+                nextAllowExecute = false
+                nextAutoExecute = false
+                nextLanguage = nil
+            elseif lower == "//allowcopy" then
+                nextAllowCopy = true
+            elseif lower == "//nocopy" then
+                nextAllowCopy = false
+            elseif lower == "//executecode" then
+                nextAllowExecute = true
+            elseif lower == "//noexecute" then
+                nextAllowExecute = false
+            elseif lower == "//autoexecute" then
+                nextAutoExecute = true
+                nextAllowCopy = false
+                nextAllowExecute = false
+            elseif lower == "//noautoexecute" then
+                nextAutoExecute = false
+            elseif lower:match("^//language%s+") then
+                nextLanguage = trimmed:match("^//language%s+(.+)$") or "code"
+            else
+                table.insert(normalLines, line)
+            end
+        else
+            if lower == "//codeend" or trimmed == "```" then
+                flushCode()
+                inCode = false
+            elseif lower == "//allowcopy" then
+                allowCopy = true
+            elseif lower == "//nocopy" then
+                allowCopy = false
+            elseif lower == "//executecode" then
+                allowExecute = true
+            elseif lower == "//noexecute" then
+                allowExecute = false
+            elseif lower == "//autoexecute" then
+                autoExecute = true
+                allowCopy = false
+                allowExecute = false
+            elseif lower == "//noautoexecute" then
+                autoExecute = false
+            elseif lower:match("^//language%s+") then
+                codeLanguage = trimmed:match("^//language%s+(.+)$") or codeLanguage
+            else
+                table.insert(codeLines, line)
+            end
+        end
+    end
+
+    if inCode then
+        flushCode()
+    end
+    flushText()
+
+    if #segments == 0 then
+        table.insert(segments, { type = "text", text = text })
+    end
+
+    return segments
+end
+
+
+local AUTOEXECUTE_BLOCKED_PATTERNS = {
+    "%f[%w_]request%s*%(",
+    "%f[%w_]http_request%s*%(",
+    "syn%s*%.%s*request",
+    "http%s*%.%s*request",
+    "game%s*:%s*httpget%s*%(",
+    "game%s*:%s*httppost%s*%(",
+    "%f[%w_]loadstring%s*%(",
+    "%f[%w_]getgenv%s*%(",
+    "%f[%w_]getrenv%s*%(",
+    "%f[%w_]getfenv%s*%(",
+    "%f[%w_]setfenv%s*%(",
+    "%f[%w_]hookfunction%s*%(",
+    "%f[%w_]hookmetamethod%s*%(",
+    "%f[%w_]getrawmetatable%s*%(",
+    "%f[%w_]setreadonly%s*%(",
+    "%f[%w_]writefile%s*%(",
+    "%f[%w_]appendfile%s*%(",
+    "%f[%w_]delfile%s*%(",
+    "%f[%w_]makefolder%s*%(",
+    "%f[%w_]delfolder%s*%(",
+    "%f[%w_]setclipboard%s*%(",
+    "%f[%w_]toclipboard%s*%(",
+}
+
+local function isSafeForAutoExecute(code)
+    local lowered = tostring(code or ""):lower()
+
+    for _, pattern in ipairs(AUTOEXECUTE_BLOCKED_PATTERNS) do
+        if lowered:find(pattern) then
+            return false, pattern
+        end
+    end
+
+    return true
+end
+
+local function executeCodeSafely(code)
+    if type(loadstring) ~= "function" then
+        return false, "loadstring is not supported in this environment."
+    end
+
+    local safe, blocked = isSafeForAutoExecute(code)
+    if not safe then
+        return false, "Blocked by autoexecute safety filter: " .. tostring(blocked)
+    end
+
+    local compileOk, compiled, compileErr = pcall(loadstring, code)
+    if not compileOk then
+        return false, "Compile call failed: " .. tostring(compiled)
+    end
+    if type(compiled) ~= "function" then
+        return false, "Compile error: " .. tostring(compileErr or compiled)
+    end
+
+    local ok, result = pcall(compiled)
+    if not ok then
+        return false, "Runtime error: " .. tostring(result)
+    end
+
+    return true, result
+end
+
+local function createAssistantResponse(text, flagInfo, renderOptions)
+    renderOptions = renderOptions or {}
+    local allowAutoExecuteNow = renderOptions.allowAutoExecute ~= false and AUTO_EXECUTE_ENABLED
+    messageCounter += 1
+
+    local row = Instance.new("Frame")
+    row.Name = "AIMessage"
+    row.Size = UDim2.new(1, -2, 0, 1)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = messageCounter
+    row.Parent = Messages
+
+    local rowList = Instance.new("UIListLayout")
+    rowList.FillDirection = Enum.FillDirection.Horizontal
+    rowList.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    rowList.VerticalAlignment = Enum.VerticalAlignment.Top
+    rowList.SortOrder = Enum.SortOrder.LayoutOrder
+    rowList.Parent = row
+
+    local holder = Instance.new("Frame")
+    holder.Name = "Bubble"
+    holder.Size = UDim2.new(0.92, 0, 0, 1)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.BackgroundColor3 = Theme.AIBubble
+    holder.BorderSizePixel = 0
+    holder.LayoutOrder = 1
+    holder.Parent = row
+    corner(holder, 13)
+    stroke(holder, Theme.Stroke, 0.35, 1)
+    padding(holder, 13, 13, 11, 11)
+
+    local list = Instance.new("UIListLayout")
+    list.FillDirection = Enum.FillDirection.Vertical
+    list.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    list.Padding = UDim.new(0, 9)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Parent = holder
+
+    list:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        updateMessageCanvas()
+    end)
+
+    for _, segment in ipairs(parseAssistantContent(text)) do
+        if segment.type == "text" then
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, 0, 0, 1)
+            label.AutomaticSize = Enum.AutomaticSize.Y
+            label.BackgroundTransparency = 1
+            label.Text = segment.text
+            label.TextColor3 = Theme.Text
+            label.Font = Enum.Font.Gotham
+            label.TextSize = 14
+            label.TextWrapped = true
+            label.RichText = false
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.TextYAlignment = Enum.TextYAlignment.Top
+            label.Parent = holder
+        elseif segment.type == "code" then
+            local codeFrame = Instance.new("Frame")
+            codeFrame.Name = "CodeBlock"
+            codeFrame.Size = UDim2.new(1, 0, 0, 1)
+            codeFrame.AutomaticSize = Enum.AutomaticSize.Y
+            codeFrame.BackgroundColor3 = Color3.fromRGB(13, 15, 20)
+            codeFrame.BorderSizePixel = 0
+            codeFrame.ClipsDescendants = true
+            codeFrame.Parent = holder
+            corner(codeFrame, 10)
+            stroke(codeFrame, Theme.Stroke, 0.25, 1)
+
+            local codeLayout = Instance.new("UIListLayout")
+            codeLayout.FillDirection = Enum.FillDirection.Vertical
+            codeLayout.SortOrder = Enum.SortOrder.LayoutOrder
+            codeLayout.Parent = codeFrame
+
+            local top = Instance.new("Frame")
+            top.Name = "CodeHeader"
+            top.Size = UDim2.new(1, 0, 0, 34)
+            top.BackgroundColor3 = Theme.Panel2
+            top.BorderSizePixel = 0
+            top.LayoutOrder = 1
+            top.Parent = codeFrame
+
+            local lang = Instance.new("TextLabel")
+            lang.Position = UDim2.fromOffset(10, 0)
+            lang.Size = UDim2.new(1, -170, 1, 0)
+            lang.BackgroundTransparency = 1
+            lang.Text = tostring(segment.language or "code")
+            lang.TextColor3 = Theme.Muted
+            lang.Font = Enum.Font.GothamMedium
+            lang.TextSize = 11
+            lang.TextXAlignment = Enum.TextXAlignment.Left
+            lang.TextTruncate = Enum.TextTruncate.AtEnd
+            lang.Parent = top
+
+            local actions = Instance.new("Frame")
+            actions.AnchorPoint = Vector2.new(1, 0.5)
+            actions.Position = UDim2.new(1, -7, 0.5, 0)
+            actions.Size = UDim2.new(0, 150, 0, 26)
+            actions.BackgroundTransparency = 1
+            actions.Parent = top
+
+            local actionList = Instance.new("UIListLayout")
+            actionList.FillDirection = Enum.FillDirection.Horizontal
+            actionList.HorizontalAlignment = Enum.HorizontalAlignment.Right
+            actionList.VerticalAlignment = Enum.VerticalAlignment.Center
+            actionList.Padding = UDim.new(0, 6)
+            actionList.Parent = actions
+
+            local codeBody = Instance.new("Frame")
+            codeBody.Name = "CodeBody"
+            codeBody.Size = UDim2.new(1, 0, 0, 1)
+            codeBody.AutomaticSize = Enum.AutomaticSize.Y
+            codeBody.BackgroundTransparency = 1
+            codeBody.LayoutOrder = 2
+            codeBody.Parent = codeFrame
+            padding(codeBody, 10, 10, 9, 10)
+
+            local codeBodyLayout = Instance.new("UIListLayout")
+            codeBodyLayout.FillDirection = Enum.FillDirection.Vertical
+            codeBodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+            codeBodyLayout.Parent = codeBody
+
+            local codeBox = Instance.new("TextBox")
+            codeBox.Name = "CodeText"
+            codeBox.Size = UDim2.new(1, 0, 0, 1)
+            codeBox.AutomaticSize = Enum.AutomaticSize.Y
+            codeBox.BackgroundTransparency = 1
+            codeBox.ClearTextOnFocus = false
+            codeBox.MultiLine = true
+            codeBox.TextEditable = false
+            -- Wrapping prevents long AI-generated lines from escaping the bubble
+            -- on mobile/small viewports.
+            codeBox.TextWrapped = true
+            codeBox.Text = segment.text
+            codeBox.TextColor3 = Theme.Text
+            codeBox.Font = Enum.Font.Code
+            codeBox.TextSize = 13
+            codeBox.TextXAlignment = Enum.TextXAlignment.Left
+            codeBox.TextYAlignment = Enum.TextYAlignment.Top
+            codeBox.LayoutOrder = 1
+            codeBox.Parent = codeBody
+
+            codeBodyLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+                updateMessageCanvas()
+            end)
+
+            codeLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+                updateMessageCanvas()
+            end)
+
+            if segment.autoExecute and allowAutoExecuteNow then
+                local autoLabel = Instance.new("TextLabel")
+                autoLabel.Size = UDim2.fromOffset(58, 24)
+                autoLabel.BackgroundColor3 = Theme.Panel3
+                autoLabel.BorderSizePixel = 0
+                autoLabel.Text = "Auto"
+                autoLabel.TextColor3 = Theme.Muted
+                autoLabel.Font = Enum.Font.GothamMedium
+                autoLabel.TextSize = 11
+                autoLabel.Parent = actions
+                corner(autoLabel, 7)
+
+                task.defer(function()
+                    task.wait()
+
+                    local ok, result = executeCodeSafely(segment.text)
+
+                    if ok then
+                        autoLabel.Text = "Ran"
+                        autoLabel.TextColor3 = Theme.Success
+
+                        if result ~= nil then
+                            createMessage("assistant", "Auto-executed successfully. Result: " .. tostring(result))
+                        end
+                    else
+                        autoLabel.Text = "Blocked"
+                        autoLabel.TextColor3 = Theme.Danger
+                        createMessage("assistant", "Auto-execute blocked/failed: " .. tostring(result))
+                    end
+                end)
+            end
+
+            if segment.allowCopy and not segment.autoExecute then
+                local copyButton = Instance.new("TextButton")
+                copyButton.Size = UDim2.fromOffset(54, 24)
+                copyButton.BackgroundColor3 = Theme.Panel3
+                copyButton.BorderSizePixel = 0
+                copyButton.Text = "Copy"
+                copyButton.TextColor3 = Theme.Text
+                copyButton.Font = Enum.Font.GothamMedium
+                copyButton.TextSize = 11
+                copyButton.AutoButtonColor = false
+                copyButton.Parent = actions
+                corner(copyButton, 7)
+
+                copyButton.MouseButton1Click:Connect(function()
+                    local clipboard = setclipboard or toclipboard
+                    if type(clipboard) == "function" then
+                        local ok = pcall(clipboard, segment.text)
+                        copyButton.Text = ok and "Copied" or "Failed"
+                    else
+                        copyButton.Text = "No API"
+                    end
+                    task.delay(1.25, function()
+                        if copyButton.Parent then
+                            copyButton.Text = "Copy"
+                        end
+                    end)
+                end)
+            end
+
+            if segment.allowExecute and not segment.autoExecute then
+                local runButton = Instance.new("TextButton")
+                runButton.Size = UDim2.fromOffset(48, 24)
+                runButton.BackgroundColor3 = Theme.Accent
+                runButton.BorderSizePixel = 0
+                runButton.Text = "Run"
+                runButton.TextColor3 = Color3.new(1, 1, 1)
+                runButton.Font = Enum.Font.GothamBold
+                runButton.TextSize = 11
+                runButton.AutoButtonColor = false
+                runButton.Parent = actions
+                corner(runButton, 7)
+
+                runButton.MouseButton1Click:Connect(function()
+                    if type(loadstring) ~= "function" then
+                        createMessage("assistant", "Run unavailable: loadstring is not supported in this environment.")
+                        return
+                    end
+
+                    runButton.Text = "..."
+                    runButton.Active = false
+
+                    local compileOk, compiled, compileErr = pcall(loadstring, segment.text)
+                    if not compileOk or type(compiled) ~= "function" then
+                        local errText = compileOk and (compileErr or compiled) or compiled
+                        createMessage("assistant", "Code compile error: " .. tostring(errText))
+                        runButton.Text = "Run"
+                        runButton.Active = true
+                        return
+                    end
+
+                    local ok, result = pcall(compiled)
+                    if ok then
+                        createMessage("assistant", "Code executed successfully." .. (result ~= nil and (" Result: " .. tostring(result)) or ""))
+                    else
+                        createMessage("assistant", "Code runtime error: " .. tostring(result))
+                    end
+
+                    runButton.Text = "Run"
+                    runButton.Active = true
+                end)
+            end
+        end
+    end
+
+    if flagInfo and flagInfo.flagged then
+        local warning = Instance.new("Frame")
+        warning.Name = "GuardrailWarning"
+        warning.Size = UDim2.new(1, 0, 0, 1)
+        warning.AutomaticSize = Enum.AutomaticSize.Y
+        warning.BackgroundColor3 = Theme.Panel2
+        warning.BorderSizePixel = 0
+        warning.LayoutOrder = 9999
+        warning.Parent = holder
+        corner(warning, 9)
+
+        local warningStroke = stroke(warning, Theme.Warning, 0.35, 1)
+
+        local warningPadding = padding(warning, 10, 10, 8, 8)
+
+        local warningText = Instance.new("TextLabel")
+        warningText.Size = UDim2.new(1, 0, 0, 1)
+        warningText.AutomaticSize = Enum.AutomaticSize.Y
+        warningText.BackgroundTransparency = 1
+        warningText.Text = "⚠ Potential prompt injection detected"
+            .. (flagInfo.reason and (" • " .. tostring(flagInfo.reason)) or "")
+            .. "\nRequest was not blocked; this is a warning only."
+        warningText.TextColor3 = Theme.Warning
+        warningText.Font = Enum.Font.GothamMedium
+        warningText.TextSize = 11
+        warningText.TextWrapped = true
+        warningText.TextXAlignment = Enum.TextXAlignment.Left
+        warningText.TextYAlignment = Enum.TextYAlignment.Top
+        warningText.Parent = warning
+    end
+
+    task.defer(function()
+        task.wait()
+        updateMessageCanvas()
+        scrollToBottom()
+    end)
+
+    return row
+end
+
+-- Saved chat is loaded and rendered after all UI/message functions are ready.
+
+local function extractAssistantText(message)
+    if type(message) ~= "table" then
+        return nil
+    end
+
+    if type(message.content) == "string" and message.content ~= "" then
+        return message.content
+    end
+
+    if type(message.content) == "table" then
+        local parts = {}
+
+        for _, part in ipairs(message.content) do
+            if type(part) == "string" then
+                table.insert(parts, part)
+            elseif type(part) == "table" and type(part.text) == "string" then
+                table.insert(parts, part.text)
+            end
+        end
+
+        if #parts > 0 then
+            return table.concat(parts, "\n")
+        end
+    end
+
+    return nil
+end
+
+-- OPENROUTER API REQUEST
+local function callOpenRouter(prompt)
+    local requestFunc = getRequestFunc()
+
+    if not requestFunc then
+        return "Error: this environment does not support HTTP requests."
+    end
+
+    if OPENROUTER_API_KEY == "" or OPENROUTER_API_KEY == "PASTE_YOUR_OPENROUTER_API_KEY_HERE" then
+        return "Error: add your OpenRouter API key to OPENROUTER_API_KEY first."
+    end
+
+    prompt = tostring(prompt)
+
+    -- IMPORTANT:
+    -- Supabase is the source of truth for conversation memory.
+    -- Save the current user turn FIRST, synchronously, then reload the ENTIRE
+    -- conversation from Supabase so every OpenRouter request receives all past turns.
+    local userSaved, userSaveErr = saveMessageToSupabase("user", prompt)
+
+    if userSaved then
+        local loaded, loadInfo = loadMessagesFromSupabase()
+
+        if not loaded then
+            warn("[OpenRouterChat] Full-history reload failed:", loadInfo)
+
+            -- Fallback: preserve the current in-memory history.
+            table.insert(chatHistory, {
+                role = "user",
+                content = prompt,
+            })
+        end
+    else
+        warn("[OpenRouterChat] Supabase user-message save failed:", userSaveErr)
+
+        -- Do not lose the turn if Supabase is temporarily unavailable.
+        table.insert(chatHistory, {
+            role = "user",
+            content = prompt,
+        })
+    end
+
+    -- Make a fresh deep-enough API message array.
+    -- We intentionally do NOT send a shortened/summarized copy here.
+    local apiMessages = {}
+
+    for _, item in ipairs(chatHistory) do
+        if type(item) == "table"
+            and type(item.role) == "string"
+            and type(item.content) == "string"
+        then
+            table.insert(apiMessages, {
+                role = item.role,
+                content = item.content,
+            })
+        end
+    end
+
+    local payload = {
+        -- Always request the free router. LAST_MODEL is display-only so a routed
+        -- base model can never accidentally become a paid follow-up request.
+        model = MODEL,
+        messages = apiMessages,
+    }
+
+    local success, result = pcall(function()
+        return requestFunc({
+            Url = "https://openrouter.ai/api/v1/chat/completions",
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["Authorization"] = "Bearer " .. tostring(OPENROUTER_API_KEY),
+                ["HTTP-Referer"] = "https://www.roblox.com/",
+                ["X-Title"] = "Roblox OpenRouter Chat"
+            },
+            Body = HttpService:JSONEncode(payload)
+        })
+    end)
+
+    if not success or not result then
+        return "Request failed: " .. tostring(result)
+    end
+
+    local statusCode = result.StatusCode or result.status
+    local responseBody = result.Body or result.body
+
+    if tonumber(statusCode) ~= 200 then
+        return "HTTP error (" .. tostring(statusCode) .. "): " .. tostring(responseBody)
+    end
+
+    local decodeSuccess, decoded = pcall(function()
+        return HttpService:JSONDecode(responseBody)
+    end)
+
+    if not decodeSuccess or type(decoded) ~= "table" then
+        return "Connected, but OpenRouter returned an unreadable response."
+    end
+
+    if type(decoded.model) == "string" and decoded.model ~= "" then
+        LAST_MODEL = decoded.model
+    end
+
+    local choices = decoded.choices
+    if type(choices) == "table" and type(choices[1]) == "table" then
+        local message = choices[1].message
+
+        local assistantText = extractAssistantText(message)
+
+        if type(assistantText) == "string" and assistantText ~= "" then
+
+            -- Save synchronously so the NEXT request cannot race ahead of persistence.
+            local assistantSaved, assistantSaveErr =
+                saveMessageToSupabase("assistant", assistantText)
+
+            if assistantSaved then
+                -- Reload again so in-memory history exactly matches persistent history.
+                local loaded, loadInfo = loadMessagesFromSupabase()
+
+                if not loaded then
+                    warn("[OpenRouterChat] Post-response history reload failed:", loadInfo)
+                    table.insert(chatHistory, {
+                        role = "assistant",
+                        content = assistantText,
+                    })
+                end
+            else
+                warn(
+                    "[OpenRouterChat] Supabase assistant-message save failed:",
+                    assistantSaveErr
+                )
+
+                table.insert(chatHistory, {
+                    role = "assistant",
+                    content = assistantText,
+                })
+            end
+
+            return assistantText
+        end
+    end
+
+    return "Connected, but OpenRouter returned no text response."
+end
+
+local requestBusy = false
+
+local function setBusy(state)
+    requestBusy = state
+    SendButton.Active = not state
+    InputBox.TextEditable = not state
+
+    if state then
+        SendButton.Text = "…"
+        SendButton.BackgroundColor3 = Theme.Panel3
+        StatusDot.BackgroundColor3 = Color3.fromRGB(246, 190, 73)
+        Subtitle.Text = MODEL .. "  •  Thinking..."
+    else
+        SendButton.Text = "↑"
+        SendButton.BackgroundColor3 = Theme.Accent
+        StatusDot.BackgroundColor3 = Theme.Success
+        Subtitle.Text = MODEL .. (LAST_MODEL and ("  •  " .. LAST_MODEL) or "  •  Ready")
+        InputBox.TextEditable = true
+    end
+end
+
+local function sendMessage()
+    if requestBusy then
+        return
+    end
+
+    local promptText = InputBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    if promptText == "" then
+        return
+    end
+
+    -- Local debug command. Avoid placing the entire potentially huge history
+    -- into one TextLabel; show exact counts and a recent preview instead.
+    if promptText:lower() == "//debugmemory" then
+        InputBox.Text = ""
+
+        local totalMessages = math.max(0, #chatHistory - 1)
+        local totalCharacters = 0
+
+        for i = 2, #chatHistory do
+            totalCharacters += #tostring(chatHistory[i].content or "")
+        end
+
+        local preview = {}
+        local startIndex = math.max(2, #chatHistory - 19)
+
+        for i = startIndex, #chatHistory do
+            local item = chatHistory[i]
+            local content = tostring(item.content or "")
+            if #content > 500 then
+                content = content:sub(1, 500) .. "…"
+            end
+
+            table.insert(
+                preview,
+                tostring(i - 1) .. ". [" .. tostring(item.role) .. "] " .. content
+            )
+        end
+
+        createMessage(
+            "assistant",
+            "FULL persistent context is loaded.\n"
+                .. "Messages: " .. tostring(totalMessages)
+                .. "\nCharacters: " .. tostring(totalCharacters)
+                .. "\nPreview (last " .. tostring(#preview) .. "):\n"
+                .. (#preview > 0 and table.concat(preview, "\n") or "(empty)")
+        )
+        return
+    end
+
+    InputBox.Text = ""
+
+    local flagged, flagReason = detectPromptInjectionFlag(promptText)
+
+    createMessage("user", promptText)
+    local loadingRow, loadingLabel = createMessage("assistant", "Thinking...", true)
+
+    setBusy(true)
+
+    task.spawn(function()
+        local aiResponse = callOpenRouter(promptText)
+
+        if loadingRow and loadingRow.Parent then
+            loadingRow:Destroy()
+        end
+
+        createAssistantResponse(aiResponse, {
+            flagged = flagged,
+            reason = flagReason,
+        })
+
+        setBusy(false)
+        scrollToBottom()
+        InputBox:CaptureFocus()
+    end)
+end
+
+SendButton.MouseButton1Click:Connect(sendMessage)
+
+InputBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed and not UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and not UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
+        sendMessage()
+    end
+end)
+
+-- CLOSE / MINIMIZE
+CloseButton.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+end)
+
+local minimized = false
+local originalSize = MainFrame.Size
+local originalShadowSize = Shadow.Size
+local originalMinSize = SizeConstraint.MinSize
+
+MinimizeButton.MouseButton1Click:Connect(function()
+    minimized = not minimized
+
+    if minimized then
+        ChatContainer.Visible = false
+        InputBar.Visible = false
+        SizeConstraint.MinSize = Vector2.new(300, 66)
+        tween(MainFrame, 0.18, {Size = UDim2.new(0, 420, 0, 66)})
+        tween(Shadow, 0.18, {Size = UDim2.new(0, 436, 0, 82)})
+        MinimizeButton.Text = "+"
+    else
+        SizeConstraint.MinSize = originalMinSize
+        tween(MainFrame, 0.18, {Size = originalSize})
+        tween(Shadow, 0.18, {Size = originalShadowSize})
+        task.delay(0.16, function()
+            if MainFrame.Parent then
+                ChatContainer.Visible = true
+                InputBar.Visible = true
+            end
+        end)
+        MinimizeButton.Text = "−"
+    end
+end)
+
+-- DRAGGING (more reliable than Frame.Draggable)
+local dragging = false
+local dragStart
+local startPosition
+
+Header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = MainFrame.Position
+    end
+end)
+
+Header.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then
+        return
+    end
+
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        local rawDelta = input.Position - dragStart
+        local currentScale = math.max(currentUiScale, 0.01)
+        local delta = rawDelta / currentScale
+        local newPos = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+
+        MainFrame.Position = newPos
+        Shadow.Position = newPos
+    end
+end)
+
+-- RESPONSIVE SCALE FOR SMALLER SCREENS
+local UIScale = Instance.new("UIScale")
+UIScale.Scale = 1
+UIScale.Parent = MainFrame
+
+local ShadowScale = Instance.new("UIScale")
+ShadowScale.Scale = 1
+ShadowScale.Parent = Shadow
+
+local viewportConnection
+
+local function updateScale()
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+
+    -- Leave a safe margin on every side and scale the whole window proportionally.
+    local safeWidth = math.max(220, viewport.X - 24)
+    local safeHeight = math.max(260, viewport.Y - 24)
+    local widthScale = safeWidth / 660
+    local heightScale = safeHeight / 510
+    local scale = math.min(1, widthScale, heightScale)
+
+    -- Supports very small phone/VR viewports instead of stopping at 68%.
+    scale = math.clamp(scale, 0.42, 1)
+    currentUiScale = scale
+    UIScale.Scale = scale
+    ShadowScale.Scale = scale
+
+    task.defer(function()
+        updateMessageCanvas()
+    end)
+
+    -- Keep the window centered after viewport/orientation changes.
+    if not dragging then
+        MainFrame.Position = UDim2.fromScale(0.5, 0.5)
+        Shadow.Position = UDim2.fromScale(0.5, 0.5)
+    end
+end
+
+local function bindViewport()
+    if viewportConnection then
+        viewportConnection:Disconnect()
+        viewportConnection = nil
+    end
+
+    local camera = workspace.CurrentCamera
+    if camera then
+        viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+    end
+    updateScale()
+end
+
+bindViewport()
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindViewport)
+
+
+-- LOAD SAVED CHAT FROM SUPABASE
+do
+    Subtitle.Text = "Loading saved chat..."
+    StatusDot.BackgroundColor3 = Color3.fromRGB(246, 190, 73)
+
+    local ok, info = loadMessagesFromSupabase()
+
+    if ok then
+        local restored = 0
+        suppressAutoScroll = true
+
+        for i = 2, #chatHistory do
+            local item = chatHistory[i]
+
+            if item.role == "user" then
+                createMessage("user", item.content)
+                restored += 1
+            elseif item.role == "assistant" then
+                -- Never re-run old //autoexecute blocks while restoring history.
+                createAssistantResponse(item.content, nil, {
+                    allowAutoExecute = false,
+                })
+                restored += 1
+            end
+
+            -- Avoid freezing the UI while restoring a large saved conversation.
+            if restored > 0 and restored % 25 == 0 then
+                task.wait()
+            end
+        end
+
+        suppressAutoScroll = false
+        updateMessageCanvas()
+        scrollToBottom()
+
+        if restored == 0 then
+            createMessage(
+                "assistant",
+                "Hey! I'm using OpenRouter free models. This chat is now saved in Supabase and restored when you reopen it."
+            )
+        end
+
+        Subtitle.Text = MODEL .. "  •  Ready • Saved"
+        StatusDot.BackgroundColor3 = Theme.Success
+    else
+        suppressAutoScroll = false
+        warn("[OpenRouterChat] Supabase history load failed:", info)
+        createMessage(
+            "MCP AI • Official",
+            "Supabase history could not be loaded, so this session started locally. Error: " .. tostring(info)
+        )
+        Subtitle.Text = MODEL .. "  •  Ready • Local"
+        StatusDot.BackgroundColor3 = Theme.Success
+    end
+end
+
+InputBox:CaptureFocus()
