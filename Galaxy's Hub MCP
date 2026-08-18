@@ -1,6 +1,3 @@
--- OpenRouter Chat UI v12 - audited/fixed persistent chat
--- Modern chat-style UI using OpenRouter free models + persistent Supabase chat history.
-
 -- CONFIGURATION
 local OPENROUTER_API_KEY = "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"
 local MODEL = "openrouter/free"
